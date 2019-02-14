@@ -28,7 +28,7 @@ from geonode.tests.base import GeoNodeBaseTestSupport
 import os
 import StringIO
 import json
-
+from geonode.api import API_NAME
 import gisdata
 from datetime import datetime
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -311,24 +311,31 @@ class DocumentsTest(GeoNodeBaseTestSupport):
         document_id = document.id
         invalid_document_id = 20
 
+        def get_resource_permissions_url(resource_id):
+            return reverse(
+                'resource_permissions', kwargs={
+                'resource_id': resource_id,
+                'resource_name': 'base',
+                'api_name': API_NAME})
         # Test that an invalid document is handled for properly
         response = self.client.post(
-            reverse(
-                'resource_permissions', args=(
-                    invalid_document_id,)), data=json.dumps(
+            get_resource_permissions_url(invalid_document_id), data=json.dumps(
                 self.perm_spec), content_type="application/json")
         self.assertEquals(response.status_code, 404)
 
         # Test that GET returns permissions
-        response = self.client.get(reverse('resource_permissions', args=(document_id,)))
-        assert('permissions' in response.content)
+        response = self.client.get(get_resource_permissions_url(document_id))
+        # NOTE: something wrong with this test as it check if permissions word
+        # in the content not permissions objector dict in the reponse so
+        # I will leave everything as it is for now
+        self.assertTrue('permissions' in response.content)
 
         # Test that a user is required to have
         # documents.change_layer_permissions
 
         # First test un-authenticated
         response = self.client.post(
-            reverse('resource_permissions', args=(document_id,)),
+            get_resource_permissions_url(document_id),
             data=json.dumps(self.perm_spec),
             content_type="application/json")
         self.assertEquals(response.status_code, 401)
@@ -337,7 +344,7 @@ class DocumentsTest(GeoNodeBaseTestSupport):
         logged_in = self.client.login(username='bobby', password='bob')
         self.assertEquals(logged_in, True)
         response = self.client.post(
-            reverse('resource_permissions', args=(document_id,)),
+            get_resource_permissions_url(document_id),
             data=json.dumps(self.perm_spec),
             content_type="application/json")
         self.assertEquals(response.status_code, 401)
@@ -346,12 +353,12 @@ class DocumentsTest(GeoNodeBaseTestSupport):
         logged_in = self.client.login(username='admin', password='admin')
         self.assertEquals(logged_in, True)
         response = self.client.post(
-            reverse('resource_permissions', args=(document_id,)),
+            get_resource_permissions_url(document_id),
             data=json.dumps(self.perm_spec),
             content_type="application/json")
 
-        # Test that the method returns 200
-        self.assertEquals(response.status_code, 200)
+        # Test that the method returns 202
+        self.assertEquals(response.status_code, 202)
 
     def test_batch_edit(self):
         Model = Document

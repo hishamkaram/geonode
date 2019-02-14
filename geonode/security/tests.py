@@ -26,7 +26,7 @@ import base64
 import urllib2
 import logging
 import gisdata
-
+from geonode.api import API_NAME
 from django.conf import settings
 from django.core.urlresolvers import reverse
 from tastypie.test import ResourceTestCaseMixin
@@ -69,6 +69,7 @@ class StreamToLogger(object):
     """
     Fake file-like stream object that redirects writes to a logger instance.
     """
+
     def __init__(self, logger, log_level=logging.INFO):
         self.logger = logger
         self.log_level = log_level
@@ -91,9 +92,12 @@ class BulkPermissionsTests(ResourceTestCaseMixin, GeoNodeBaseTestSupport):
         self.list_url = reverse(
             'api_dispatch_list',
             kwargs={
-                'api_name': 'api',
+                'api_name': API_NAME,
                 'resource_name': 'layers'})
-        self.bulk_perms_url = reverse('bulk_permissions')
+        self.bulk_perms_url = reverse('bulk_permissions',
+                                      kwargs={
+                                    'resource_name': 'base',
+                                    'api_name': API_NAME})
         all_public()
         self.perm_spec = {
             "users": {"admin": ["view_resourcebase"]}, "groups": {}}
@@ -121,7 +125,7 @@ class BulkPermissionsTests(ResourceTestCaseMixin, GeoNodeBaseTestSupport):
             'resources': layers_id
         }
         resp = self.client.post(self.bulk_perms_url, data)
-        self.assertHttpOK(resp)
+        self.assertHttpAccepted(resp)
 
         if check_ogc_backend(geoserver.BACKEND_PACKAGE):
             # Check GeoFence Rules have been correctly created
@@ -752,35 +756,35 @@ class PermissionsTest(GeoNodeBaseTestSupport):
     def test_ajax_layer_permissions(self):
         """Verify that the ajax_layer_permissions view is behaving as expected
         """
-
+        def get_resource_permissions_url(resource_id):
+            return reverse(
+                'resource_permissions', kwargs={
+                'resource_id': resource_id,
+                'resource_name': 'base',
+                'api_name': API_NAME})
         # Setup some layer names to work with
         valid_layer_typename = Layer.objects.all()[0].id
         invalid_layer_id = 9999999
 
         # Test that an invalid layer.alternate is handled for properly
         response = self.client.post(
-            reverse(
-                'resource_permissions', args=(
-                    invalid_layer_id,)), data=json.dumps(
+            get_resource_permissions_url(invalid_layer_id), data=json.dumps(
                 self.perm_spec), content_type="application/json")
         self.assertEquals(response.status_code, 404)
 
         # Test that GET returns permissions
         response = self.client.get(
-            reverse(
-                'resource_permissions',
-                args=(
-                    valid_layer_typename,
-                )))
-        assert('permissions' in response.content)
+            get_resource_permissions_url(valid_layer_typename))
+        # NOTE: something wrong with this test as it check if permissions word
+        # in the content not permissions objector dict in the reponse so
+        # I will leave everything as it is for now
+        self.assertTrue('permissions' in response.content)
 
         # Test that a user is required to have maps.change_layer_permissions
 
         # First test un-authenticated
         response = self.client.post(
-            reverse(
-                'resource_permissions', args=(
-                    valid_layer_typename,)), data=json.dumps(
+            get_resource_permissions_url(valid_layer_typename), data=json.dumps(
                 self.perm_spec), content_type="application/json")
         self.assertEquals(response.status_code, 401)
 
@@ -788,24 +792,20 @@ class PermissionsTest(GeoNodeBaseTestSupport):
         logged_in = self.client.login(username='bobby', password='bob')
         self.assertEquals(logged_in, True)
         response = self.client.post(
-            reverse(
-                'resource_permissions', args=(
-                    valid_layer_typename,)), data=json.dumps(
+            get_resource_permissions_url(valid_layer_typename), data=json.dumps(
                 self.perm_spec), content_type="application/json")
-        self.assertEquals(response.status_code, 200)
+        self.assertEquals(response.status_code, 202)
 
         # Login as a user with the proper permission and test the endpoint
         logged_in = self.client.login(username='admin', password='admin')
         self.assertEquals(logged_in, True)
 
         response = self.client.post(
-            reverse(
-                'resource_permissions', args=(
-                    valid_layer_typename,)), data=json.dumps(
+            get_resource_permissions_url(valid_layer_typename), data=json.dumps(
                 self.perm_spec), content_type="application/json")
 
-        # Test that the method returns 200
-        self.assertEquals(response.status_code, 200)
+        # Test that the method returns 202
+        self.assertEquals(response.status_code, 202)
 
         # Test that the permissions specification is applied
 
@@ -1072,9 +1072,12 @@ class GisBackendSignalsTests(ResourceTestCaseMixin, GeoNodeBaseTestSupport):
         self.list_url = reverse(
             'api_dispatch_list',
             kwargs={
-                'api_name': 'api',
+                'api_name': API_NAME,
                 'resource_name': 'layers'})
-        self.bulk_perms_url = reverse('bulk_permissions')
+        self.bulk_perms_url = reverse('bulk_permissions',
+                                      kwargs={
+                                    'resource_name': 'base',
+                                    'api_name': API_NAME})
         all_public()
         self.perm_spec = {
             "users": {"admin": ["view_resourcebase"]}, "groups": {}}

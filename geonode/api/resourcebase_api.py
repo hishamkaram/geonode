@@ -25,11 +25,9 @@ from django.db.models import Q
 from django.http import HttpResponse
 from django.conf import settings
 from django.contrib.staticfiles.templatetags import staticfiles
-from tastypie.authentication import MultiAuthentication, SessionAuthentication
 from django.template.response import TemplateResponse
 from tastypie import http
 from tastypie.bundle import Bundle
-
 from tastypie.constants import ALL, ALL_WITH_RELATIONS
 from tastypie.resources import ModelResource
 from tastypie import fields
@@ -55,9 +53,11 @@ from geonode.people.models import Profile
 from geonode.groups.models import GroupProfile
 from geonode.utils import check_ogc_backend
 from geonode.security.utils import get_visible_resources
-
-from .authorization import GeoNodeAuthorization, GeonodeApiKeyAuthentication
-
+from .constants import API_AUTHENTICATION
+from .authorization import GeoNodeAuthorization
+from django.core.exceptions import PermissionDenied
+from geonode.utils import resolve_object
+from geonode.security.views import _perms_info, _perms_info_json
 from .api import (TagResource,
                   RegionResource,
                   OwnersResource,
@@ -658,13 +658,186 @@ class ResourceBaseResource(CommonModelApi):
 
     """ResourceBase api"""
 
+    def get_err_response(self,
+                         request,
+                         message,
+                         response_class=http.HttpApplicationError):
+        data = {
+            'error': message,
+        }
+        return self.error_response(
+            request, data, response_class=response_class)
+
+    def prepend_urls(self):
+        return [
+            url(r"^(?P<resource_name>%s)/(?P<resource_id>[\d]+)/permissions%s$"
+                % (self._meta.resource_name, trailing_slash()),
+                self.wrap_view('resource_permissions'),
+                name="resource_permissions"),
+            url(r"^(?P<resource_name>%s)/bulk-permissions%s$"
+                % (self._meta.resource_name, trailing_slash()),
+                self.wrap_view('set_bulk_permissions'),
+                name="bulk_permissions"),
+            url(r"^(?P<resource_name>%s)/invalidate-permissions-cache%s$"
+                % (self._meta.resource_name, trailing_slash()),
+                self.wrap_view('invalidate_permissions_cache'),
+                name="invalidate_permissions_cache"),
+            url(r"^(?P<resource_name>%s)/invalidate_tiledlayer_cache%s$"
+                % (self._meta.resource_name, trailing_slash()),
+                self.wrap_view('invalidate_tiledlayer_cache'),
+                name="invalidate_tiledlayer_cache"),
+        ]
+
+    def invalidate_tiledlayer_cache(self, request, **kwargs):
+        self.method_check(request, allowed=['post'])
+        self.is_authenticated(request)
+        self.throttle_check(request)
+        from geonode.security.utils import set_geowebcache_invalidate_cache
+        uuid = request.POST.get('uuid', None)
+        if not uuid:
+            return self.get_err_response(request, "uuid Required",
+                                         http.HttpBadRequest)
+        resource = None
+        try:
+            resource = ResourceBase.objects.get(uuid=uuid)
+        except ObjectDoesNotExist as e:
+            return self.get_err_response(request, e.message,
+                                         http.HttpNotFound)
+        can_change_data = request.user.has_perm(
+            'change_resourcebase',
+            resource)
+        layer = Layer.objects.get(id=resource.id)
+        if layer and can_change_data:
+            set_geowebcache_invalidate_cache(layer.alternate)
+            return self.create_response(request,
+                                        {'success': 'ok',
+                                         'message': 'GeoWebCache Tiled Layer Emptied!'})
+        else:
+            return self.create_response(request,
+                                        {'success': 'false',
+                                         'message': 'You cannot modify this resource!'},
+                                        http.HttpUnauthorized)
+
+    def invalidate_permissions_cache(self, request, **kwargs):
+        self.method_check(request, allowed=['post'])
+        self.is_authenticated(request)
+        self.throttle_check(request)
+        from geonode.security.utils import set_geofence_invalidate_cache
+        uuid = request.POST.get('uuid', None)
+        if not uuid:
+            return self.get_err_response(request, "uuid Required",
+                                         http.HttpBadRequest)
+        resource = None
+        try:
+            resource = ResourceBase.objects.get(uuid=uuid)
+        except ObjectDoesNotExist as e:
+            return self.get_err_response(request, e.message,
+                                         http.HttpNotFound)
+        can_change_permissions = request.user.has_perm(
+            'change_resourcebase_permissions',
+            resource)
+        if can_change_permissions:
+            set_geofence_invalidate_cache()
+            return self.create_response(request,
+                                        {'success': 'ok',
+                                         'message':
+                                         'GeoFence Security Rules Cache Refreshed!'},
+                                        http.HttpAccepted)
+        else:
+            return self.create_response(request,
+                                        {'success': 'false',
+                                         'message': 'You cannot modify this resource!'},
+                                        http.HttpUnauthorized)
+
+    def resource_permissions(self, request, resource_id, **kwargs):
+        self.method_check(request, allowed=['get', 'post'])
+        self.is_authenticated(request)
+        self.throttle_check(request)
+        resource = None
+        try:
+            resource = resolve_object(
+                request, ResourceBase, {
+                    'id': resource_id}, 'base.change_resourcebase_permissions')
+
+        except (PermissionDenied, ObjectDoesNotExist):
+            return self.get_err_response(request,
+                                         'You are not allowed to change' +
+                                         ' permissions for this resource',
+                                         http.HttpUnauthorized)
+        if request.method == 'POST':
+            success = True
+            message = "Permissions successfully updated!"
+            try:
+                permission_spec = json.loads(request.body)
+                resource.set_permissions(permission_spec)
+
+                # Check Users Permissions Consistency
+                info = _perms_info(resource)
+                info_users = dict([(u.username, perms)
+                                   for u, perms in info['users'].items()])
+                for user, perms in info_users.items():
+                    if 'download_resourcebase' in perms and 'view_resourcebase' not in perms:
+                        success = False
+                        message = 'User ' + str(user) + ' has Download permissions but ' \
+                            'cannot access the resource. ' \
+                            'Please update permissions consistently!'
+            except BaseException:
+                success = False
+                message = "Error updating permissions :("
+                return self.create_response(request,
+                                            {'success': success,
+                                                'message': message},
+                                            http.HttpApplicationError)
+            response_class = http.HttpApplicationError if not success else http.HttpAccepted
+            return self.create_response(request, {'success': success, 'message': message},
+                                        response_class)
+
+        elif request.method == 'GET':
+            permission_spec = _perms_info_json(resource)
+            return self.create_response(request,
+                                        {'success': True,
+                                            'permissions': json.loads(permission_spec)},
+                                        http.HttpAccepted)
+        else:
+            return self.get_err_response(request,
+                                         'No methods other than get and post are allowed',
+                                         http.HttpMethodNotAllowed)
+
+    def set_bulk_permissions(self, request, **kwargs):
+        self.method_check(request, allowed=['post'])
+        self.is_authenticated(request)
+        self.throttle_check(request)
+        permission_spec = json.loads(request.POST.get('permissions', None))
+        resource_ids = request.POST.getlist('resources', [])
+        if permission_spec is not None:
+            not_permitted = []
+            for resource_id in resource_ids:
+                try:
+                    resource = resolve_object(
+                        request, ResourceBase, {
+                            'id': resource_id
+                        },
+                        'base.change_resourcebase_permissions')
+                    resource.set_permissions(permission_spec)
+                except (PermissionDenied, ObjectDoesNotExist) as e:
+                    if isinstance(e, PermissionDenied):
+                        resource = ResourceBase.objects.get(id=resource_id)
+                        not_permitted.append(resource.title)
+            return self.create_response(request,
+                                        {'success': 'ok', 'not_changed': not_permitted},
+                                        http.HttpAccepted)
+        else:
+            return self.create_response(request,
+                                        {'error': 'Wrong permissions specification'},
+                                        http.HttpBadRequest)
+
     class Meta(CommonMetaApi):
         paginator_class = CrossSiteXHRPaginator
         queryset = ResourceBase.objects.polymorphic_queryset() \
             .distinct().order_by('-date')
         resource_name = 'base'
         excludes = ['csw_anytext', 'metadata_xml']
-        authentication = MultiAuthentication(SessionAuthentication(), GeonodeApiKeyAuthentication())
+        authentication = API_AUTHENTICATION
 
 
 class FeaturedResourceBaseResource(CommonModelApi):
@@ -675,7 +848,7 @@ class FeaturedResourceBaseResource(CommonModelApi):
         paginator_class = CrossSiteXHRPaginator
         queryset = ResourceBase.objects.filter(featured=True).order_by('-date')
         resource_name = 'featured'
-        authentication = MultiAuthentication(SessionAuthentication(), GeonodeApiKeyAuthentication())
+        authentication = API_AUTHENTICATION
 
 
 class LayerResource(CommonModelApi):
@@ -894,7 +1067,7 @@ class LayerResource(CommonModelApi):
         include_resource_uri = True
         allowed_methods = ['get', 'patch']
         excludes = ['csw_anytext', 'metadata_xml']
-        authentication = MultiAuthentication(SessionAuthentication(), GeonodeApiKeyAuthentication())
+        authentication = API_AUTHENTICATION
         filtering = CommonMetaApi.filtering
         # Allow filtering using ID
         filtering.update({
@@ -971,7 +1144,7 @@ class MapResource(CommonModelApi):
         paginator_class = CrossSiteXHRPaginator
         queryset = Map.objects.distinct().order_by('-date')
         resource_name = 'maps'
-        authentication = MultiAuthentication(SessionAuthentication(), GeonodeApiKeyAuthentication())
+        authentication = API_AUTHENTICATION
 
 
 class DocumentResource(CommonModelApi):
@@ -1021,4 +1194,4 @@ class DocumentResource(CommonModelApi):
         filtering.update({'doc_type': ALL})
         queryset = Document.objects.distinct().order_by('-date')
         resource_name = 'documents'
-        authentication = MultiAuthentication(SessionAuthentication(), GeonodeApiKeyAuthentication())
+        authentication = API_AUTHENTICATION
